@@ -96,6 +96,7 @@ func (m *Manager) Run() error {
 		return err
 	}
 
+	log.Info("Listing modules and dependencies")
 	modules, err := m.Plugin.ListModulesWithDeps(modulePath)
 	if err != nil {
 		log.Error(err)

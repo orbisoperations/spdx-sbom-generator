@@ -7,11 +7,16 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
+
+	"gopkg.in/yaml.v3"
+
+	log "github.com/sirupsen/logrus"
 
 	"github.com/spdx/spdx-sbom-generator/pkg/helper"
 	"github.com/spdx/spdx-sbom-generator/pkg/models"
@@ -26,7 +31,7 @@ var (
 	errDependenciesNotFound = errors.New("unable to generate SPDX file, no modules founded. Please install them before running spdx-sbom-generator, e.g.: `yarn install`")
 	yarnRegistry            = "https://registry.yarnpkg.com"
 	lockFile                = "yarn.lock"
-	rg = regexp.MustCompile(`^(((git|hg|svn|bzr)\+)?(http:\/\/www\.|https:\/\/www\.|http:\/\/|https:\/\/|ssh:\/\/|git:\/\/|svn:\/\/|sftp:\/\/|ftp:\/\/)?[a-z0-9]+([\-\.]{1}[a-z0-9]+){0,100}\.[a-z]{2,5}(:[0-9]{1,5})?(\/.*))|(git\+git@[a-zA-Z0-9\.]+:[a-zA-Z0-9/\\.@]+)|(bzr\+lp:[a-zA-Z0-9\.]+)$`)
+	rg                      = regexp.MustCompile(`^(((git|hg|svn|bzr)\+)?(http:\/\/www\.|https:\/\/www\.|http:\/\/|https:\/\/|ssh:\/\/|git:\/\/|svn:\/\/|sftp:\/\/|ftp:\/\/)?[a-z0-9]+([\-\.]{1}[a-z0-9]+){0,100}\.[a-z]{2,5}(:[0-9]{1,5})?(\/.*))|(git\+git@[a-zA-Z0-9\.]+:[a-zA-Z0-9/\\.@]+)|(bzr\+lp:[a-zA-Z0-9\.]+)$`)
 )
 
 // New creates a new yarn instance
@@ -59,6 +64,7 @@ func (m *yarn) IsValid(path string) bool {
 
 // HasModulesInstalled checks if modules of manifest file already installed
 func (m *yarn) HasModulesInstalled(path string) error {
+	log.Info("Checking for installed modules")
 	for _, p := range m.metadata.ModulePath {
 		if !helper.Exists(filepath.Join(path, p)) {
 			return errDependenciesNotFound
@@ -114,7 +120,7 @@ func (m *yarn) GetRootModule(path string) (*models.Module, error) {
 	}
 	repository := pkResult["repository"]
 	if repository != nil {
-		if rep, ok := repository.(string); ok{
+		if rep, ok := repository.(string); ok {
 			mod.PackageDownloadLocation = rep
 		}
 		if _, ok := repository.(map[string]interface{}); ok && repository.(map[string]interface{})["url"] != nil {
@@ -132,6 +138,7 @@ func (m *yarn) GetRootModule(path string) (*models.Module, error) {
 	mod.Copyright = getCopyright(path)
 	modLic, err := helper.GetLicenses(path)
 	if err != nil {
+		log.Debug("error finding license file: %s\n", err.Error())
 		return mod, nil
 	}
 	mod.LicenseDeclared = helper.BuildLicenseDeclared(modLic.ID)
@@ -165,13 +172,26 @@ func (m *yarn) ListUsedModules(path string) ([]models.Module, error) {
 
 // ListModulesWithDeps return all info of installed modules
 func (m *yarn) ListModulesWithDeps(path string) ([]models.Module, error) {
-	deps, err := readLockFile(filepath.Join(path, lockFile))
-	allDeps := appendNestedDependencies(deps)
+	yarnv2Deps, err := readLockV2File(filepath.Join(path, lockFile))
 	if err != nil {
-		return nil, err
-	}
+		log.Infof("error parsing yarn v2 lock file - defaulting to yarn v1\n")
 
-	return m.buildDependencies(path, allDeps)
+		deps, err := readLockFile(filepath.Join(path, lockFile))
+		allDeps := appendNestedDependencies(deps)
+		if err != nil {
+			return nil, err
+		}
+
+		return m.buildDependencies(path, allDeps)
+	} else {
+		log.Debug("creating dependencies based on yarn v2")
+		allDeps, err := appendNestedDependenciesV2(yarnv2Deps)
+		if err != nil {
+			return nil, err
+		}
+
+		return buildDepenenciesV2(path, allDeps, m)
+	}
 }
 
 func (m *yarn) buildDependencies(path string, deps []dependency) ([]models.Module, error) {
@@ -259,6 +279,87 @@ func (m *yarn) buildDependencies(path string, deps []dependency) ([]models.Modul
 	return modules, nil
 }
 
+func buildDepenenciesV2(path string, deps []dependencyV2, yarn *yarn) ([]models.Module, error) {
+	modules := make([]models.Module, 0)
+	rootModule, err := yarn.GetRootModule(path)
+	if err != nil {
+		log.Errorf("error creating root module - %s\n", err.Error())
+		//return modules, err
+	}
+
+	sha256Hash := fmt.Sprintf("%x", sha256.Sum256([]byte(fmt.Sprintf("%s-%s", rootModule.Name, rootModule.Version))))
+	rootModule.CheckSum = &models.CheckSum{
+		Algorithm: "SHA256",
+		Value:     sha256Hash,
+	}
+
+	rootModule.Supplier.Name = rootModule.Name
+
+	if rootModule.PackageDownloadLocation == "" {
+		rootModule.PackageDownloadLocation = rootModule.Name
+	}
+
+	// add the project module
+	modules = append(modules, *rootModule)
+
+	// for every dependency, add it to the root module
+	// then parse its dependencies into sub-modules
+	for _, dep := range deps {
+		mod := models.Module{
+			Name:     dep.Name,
+			Version:  extractVersion(dep.Version),
+			CheckSum: &models.CheckSum{Content: []byte(fmt.Sprintf("%s-%s", dep.Name, dep.Version))},
+			//PackageDownloadLocation: dep.Resolution,
+			Supplier: models.SupplierContact{
+				Name: dep.Name,
+			},
+			PackageURL: getPackageHomepage(filepath.Join(path, yarn.metadata.ModulePath[0], dep.Name, yarn.metadata.Manifest[0])),
+		}
+
+		if dep.Resolution == "" {
+			mod.PackageDownloadLocation = fmt.Sprintf("https://www.yarnpkg.com/package/%s", mod.Name)
+		} else {
+			mod.PackageDownloadLocation = dep.Resolution
+		}
+
+		log.Debugf("%#v\n", mod)
+		licensePath := filepath.Join(path, yarn.metadata.ModulePath[0], dep.Name, "LICENSE")
+		if helper.Exists(licensePath) {
+			r := reader.New(licensePath)
+			s := r.StringFromFile()
+			mod.Copyright = helper.GetCopyright(s)
+		}
+
+		modLic, err := helper.GetLicenses(filepath.Join(path, yarn.metadata.ModulePath[0], dep.Name))
+		if err != nil {
+			log.Warnf("unable to get licenses for package %s - %s\n", dep.Name, err.Error())
+		} else {
+			mod.LicenseDeclared = helper.BuildLicenseDeclared(modLic.ID)
+			mod.LicenseConcluded = helper.BuildLicenseConcluded(modLic.ID)
+			mod.CommentsLicense = modLic.Comments
+			if !helper.LicenseSPDXExists(modLic.ID) {
+				mod.OtherLicense = append(mod.OtherLicense, modLic)
+			}
+		}
+
+		// now add dependencies of dependencies
+		if len(dep.Dependencies) > 0 {
+			mod.Modules = map[string]*models.Module{}
+			for subDepName, subDepVersion := range dep.Dependencies {
+				mod.Modules[subDepName] = &models.Module{
+					Name:     subDepName,
+					Version:  extractVersion(subDepVersion),
+					CheckSum: &models.CheckSum{Content: []byte(fmt.Sprintf("%s-%s", subDepName, subDepVersion))},
+				}
+			}
+		}
+
+		modules = append(modules, mod)
+
+	}
+	return modules, nil
+}
+
 func readLockFile(path string) ([]dependency, error) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -336,6 +437,31 @@ func readLockFile(path string) ([]dependency, error) {
 	return p, nil
 }
 
+func readLockV2File(path string) (yarnV2, error) {
+	log.Debugf("reading lock file from %s", path)
+	fileBytes, err := ioutil.ReadFile(path)
+	if err != nil {
+		log.Infof("error parsing lock file (%s) as yarn v2 lock file - may be yarn v1.\n", path)
+		log.Infof("error: %s\n", err.Error())
+		return nil, err
+	}
+
+	log.Debugf("lock file conents: %s\n", string(fileBytes))
+
+	yv2 := yarnV2{}
+
+	err = yaml.Unmarshal(fileBytes, yv2)
+	if err != nil {
+		log.Infof("error unmarshalling lock file (%s) as yarn v2 lock file - may be yarn v1.\n", path)
+		log.Infof("error: %s\n", err.Error())
+		return nil, err
+	}
+
+	log.Debugf("yarn v2 lock: %#v\n", yv2)
+
+	return yv2, nil
+}
+
 func getCopyright(path string) string {
 	licensePath := filepath.Join(path, "LICENSE")
 	if helper.Exists(licensePath) {
@@ -386,8 +512,13 @@ func appendNestedDependencies(deps []dependency) []dependency {
 		if len(d.Dependencies) > 0 {
 			for _, depD := range d.Dependencies {
 				ar := strings.Split(strings.TrimSpace(depD), " ")
+
 				name := strings.TrimPrefix(strings.TrimSuffix(strings.TrimPrefix(ar[0], "\""), "\""), "@")
-				if name == "optionalDependencies:" {
+
+				if len(ar) < 2 {
+					// remove single check for optionalDependencies and ignore all deps that do not
+					// have specified versions
+					fmt.Printf("warning: no version specified when parsing dependency string %s (%#v) for parent dependency %s\n", depD, name, d.Name)
 					continue
 				}
 
@@ -400,4 +531,23 @@ func appendNestedDependencies(deps []dependency) []dependency {
 		}
 	}
 	return allDeps
+}
+
+func appendNestedDependenciesV2(y yarnV2) ([]dependencyV2, error) {
+	allDeps := make([]dependencyV2, 0)
+	for _, dep := range y {
+		name := strings.Split(dep.Resolution, "@npm:")[0]
+		dep.Name = name
+		allDeps = append(allDeps, dep)
+
+		for subDepName, subDepVersion := range dep.Dependencies {
+			allDeps = append(allDeps, dependencyV2{
+				Name:         subDepName,
+				Version:      subDepVersion,
+				Dependencies: map[string]string{},
+			})
+		}
+	}
+
+	return allDeps, nil
 }

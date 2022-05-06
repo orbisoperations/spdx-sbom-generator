@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"gopkg.in/yaml.v3"
 
 	"github.com/spdx/spdx-sbom-generator/pkg/models"
 )
@@ -147,4 +148,33 @@ func getPath() string {
 	path := strings.TrimSuffix(string(output), "\n")
 
 	return path
+}
+
+func TestYarnV2Yaml(t *testing.T) {
+	doc := `
+"ampproject/remapping@npm:^2.1.0":
+    version: 2.1.2
+    resolution: "@ampproject/remapping@npm:2.1.2"
+    dependencies:
+        "jridgewell/trace-mapping": ^0.3.0
+    checksum: e023f92cdd9723f3042cde3b4d922adfeef0e198aa73486b0b6c034ad36af5f96e5c0cc72b335b30b2eb9852d907efc92af6bfcd3f4b4d286177ee32a189cf92
+    languageName: node
+    linkType: hard
+`
+
+	m := map[string]interface{}{}
+
+	err := yaml.Unmarshal([]byte(doc), &m)
+	t.Log(err, m)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+
+	v2 := yarnV2{}
+
+	err = yaml.Unmarshal([]byte(doc), v2)
+	t.Log(err, m)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
 }
